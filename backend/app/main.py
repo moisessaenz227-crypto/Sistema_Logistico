@@ -7,7 +7,8 @@ import smtplib
 from email.message import EmailMessage
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
-
+from fpdf import FPDF
+from cryptography.fernet import Fernet
 import jwt
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -42,6 +43,63 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 
+
+# Llave maestra para cifrar datos sensibles guardados en la base de datos (viene del .env).
+ENCRYPTION_KEY_RAW = os.getenv("ENCRYPTION_KEY")
+_fernet = Fernet(ENCRYPTION_KEY_RAW.encode()) if ENCRYPTION_KEY_RAW else None
+
+# Estas claves de configuración se guardan CIFRADAS en la base de datos.
+CLAVES_SENSIBLES = {"SMTP_PASSWORD"}
+
+
+def _config_obtener(db: Session, clave: str, default=None):
+    """Lee un valor de configuración. Si no está en la base de datos, usa el .env o el default."""
+    fila = db.query(models.Configuracion).filter(models.Configuracion.clave == clave).first()
+    if fila is None:
+        return os.getenv(clave, default)
+
+    valor = fila.valor
+    if clave in CLAVES_SENSIBLES and _fernet is not None:
+        try:
+            valor = _fernet.decrypt(valor.encode()).decode()
+        except Exception:
+            return default
+    return valor
+
+
+def _config_guardar(db: Session, clave: str, valor: str):
+    """Crea o actualiza un valor de configuración. Si la clave es sensible, se guarda cifrado."""
+    if clave in CLAVES_SENSIBLES:
+        if _fernet is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Falta ENCRYPTION_KEY en el .env para poder guardar valores sensibles",
+            )
+        valor_a_guardar = _fernet.encrypt(valor.encode()).decode()
+    else:
+        valor_a_guardar = valor
+
+    fila = db.query(models.Configuracion).filter(models.Configuracion.clave == clave).first()
+    if fila is None:
+        fila = models.Configuracion(clave=clave, valor=valor_a_guardar)
+        db.add(fila)
+    else:
+        fila.valor = valor_a_guardar
+
+    db.commit()
+    db.refresh(fila)
+    return fila
+
+
+def _iva_vigente(db: Session) -> float:
+    """El IVA guardado en Configuracion (clave IVA_PORCENTAJE), o 15.0 si todavia no se configuro."""
+    valor = _config_obtener(db, "IVA_PORCENTAJE", str(IVA_VIGENTE))
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return IVA_VIGENTE
+
+    
 # ---------------- UTILIDADES ----------------
 
 def _nombre(db: Session, clase: str, registro_id):
@@ -61,6 +119,19 @@ def _rol_de(db: Session, usuario: models.Usuarios) -> Optional[str]:
     return rol.nombre if rol is not None else None
 
 
+def _correo_de_usuario(db: Session, usuario_id):
+    """Correo del trabajador ligado a un usuario cualquiera (o None)."""
+    if usuario_id is None:
+        return None
+    usuario = db.query(models.Usuarios).filter(models.Usuarios.id == usuario_id).first()
+    if usuario is None:
+        return None
+    trabajador = db.query(models.Trabajadores).filter(
+        models.Trabajadores.id == usuario.trabajador_id
+    ).first()
+    return trabajador.correo if trabajador is not None else None
+
+
 # ---------------- PERMISOS ----------------
 
 VER, CREAR, EDITAR, ELIMINAR, JALAR, NOTIFICAR = "ver", "crear", "editar", "eliminar", "jalar", "notificar"
@@ -70,6 +141,9 @@ PERMISOS = {
     "seguridad": {
         "ADMINISTRADOR": TODO,
     },
+        "configuracion": {
+        "ADMINISTRADOR": TODO,
+    },    
     "companias": {
         "ADMINISTRADOR": TODO,
         "OPERACIONES": {VER, CREAR, EDITAR},
@@ -290,6 +364,56 @@ def _es_mia_cotizacion(db: Session, usuario: models.Usuarios, cotizacion: models
     return False
 
 
+def _generar_pdf_cotizacion(db: Session, cotizacion: models.Cotizacion) -> bytes:
+    """PDF de una pagina con el detalle de la Cotizacion (para el correo a la Customer)."""
+    pdf = FPDF()
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(20, 60, 120)
+    pdf.cell(0, 10, f"COTIZACION #{cotizacion.id}", ln=True)
+    pdf.set_draw_color(20, 60, 120)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    filas = [
+        ("Cliente", _nombre(db, "Companias", cotizacion.compania_cliente_id)),
+        ("Agente", _nombre(db, "Companias", cotizacion.agente_id)),
+        ("Incoterm", _nombre(db, "Incoterms", cotizacion.incoterm_id)),
+        ("Shipper", cotizacion.shipper_nombre),
+        ("País de origen", _nombre(db, "Paises", cotizacion.pais_origen_id)),
+        ("Puerto de origen", _nombre(db, "Puertos", cotizacion.puerto_origen_id)),
+        ("Estado", cotizacion.estado),
+    ]
+    pdf.set_text_color(0, 0, 0)
+    for etiqueta, valor in filas:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(50, 8, f"{etiqueta}:")
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 8, str(valor) if valor else "-", ln=True)
+
+    valores = db.query(models.CotizacionValores).filter(
+        models.CotizacionValores.cotizacion_id == cotizacion.id
+    ).all()
+    if valores:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_fill_color(20, 60, 120)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(80, 8, "Rubro", border=1, fill=True)
+        pdf.cell(40, 8, "Compra", border=1, fill=True, align="R")
+        pdf.cell(40, 8, "Venta", border=1, fill=True, align="R", ln=True)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 11)
+        for v in valores:
+            pdf.cell(80, 8, _nombre(db, "Rubros", v.rubro_id) or "-", border=1)
+            pdf.cell(40, 8, f"{v.compra:.2f}", border=1, align="R")
+            pdf.cell(40, 8, f"{v.venta:.2f}", border=1, align="R", ln=True)
+
+    return bytes(pdf.output())
+
+
 @app.post("/cotizaciones", response_model=schemas.CotizacionRead)
 def crear_cotizacion(
     cotizacion: schemas.CotizacionCreate,
@@ -306,6 +430,42 @@ def crear_cotizacion(
         db.add(models.CotizacionValores(cotizacion_id=nueva.id, **valor.model_dump()))
     db.commit()
     db.refresh(nueva)
+    return nueva@app.post("/cotizaciones", response_model=schemas.CotizacionRead)
+def crear_cotizacion(
+    cotizacion: schemas.CotizacionCreate,
+    db: Session = Depends(get_db),
+    actor=Depends(requiere("cotizaciones", CREAR)),
+):
+    datos = cotizacion.model_dump(exclude={"valores"})
+    nueva = models.Cotizacion(**datos, usuario_creador_id=actor.id)
+    db.add(nueva)
+    db.commit()
+    db.refresh(nueva)
+
+    for valor in cotizacion.valores:
+        db.add(models.CotizacionValores(cotizacion_id=nueva.id, **valor.model_dump()))
+    db.commit()
+    db.refresh(nueva)
+
+    # Correo a la Customer con el PDF adjunto. Si falla o no hay SMTP, NO se bloquea
+    # la creacion de la Cotizacion: el correo es un extra, no el paso principal.
+    try:
+        correo_customer = _correo_de_usuario(db, nueva.usuario_customer_id)
+        if correo_customer and SMTP_HOST:
+            pdf_bytes = _generar_pdf_cotizacion(db, nueva)
+            asunto = f"Nueva Cotización #{nueva.id} asignada"
+            cuerpo = (
+                f"Estimados, buenas tardes.\n\n"
+                f"Se le asignó la Cotización #{nueva.id}. Se adjunta el detalle en PDF.\n\n"
+                f"Puede revisarla y confirmarla desde el sistema.\n\n"
+                f"Saludos cordiales."
+            )
+            _enviar_correo(
+                db, [correo_customer], asunto, cuerpo, [(f"Cotizacion_{nueva.id}.pdf", pdf_bytes)]
+            )
+    except Exception:
+        pass 
+
     return nueva
 
 
@@ -349,7 +509,7 @@ def jalar_cotizacion(
         puerto_origen_id=cot.puerto_origen_id,
         usuario_creador_id=cot.usuario_creador_id,
         usuario_customer_id=cot.usuario_customer_id,
-        iva_porcentaje=IVA_VIGENTE,
+        iva_porcentaje=_iva_vigente(db),
     )
     db.add(nuevo_routing)
     db.commit()
@@ -463,6 +623,68 @@ def obtener_routing(
     return routing
 
 
+def _generar_pdf_routing(db: Session, routing: models.Routing) -> bytes:
+    """Arma un PDF de una pagina con el detalle del Routing (para el correo a la Customer)."""
+    pdf = FPDF()
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(20, 60, 120)
+    pdf.cell(0, 10, f"ROUTING {routing.numero_routing or ''}", ln=True)
+    pdf.set_draw_color(20, 60, 120)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    filas = [
+        ("Cliente", _nombre(db, "Companias", routing.compania_cliente_id)),
+        ("Agente", _nombre(db, "Companias", routing.agente_id)),
+        ("Incoterm", _nombre(db, "Incoterms", routing.incoterm_id)),
+        ("Consignatario", _nombre(db, "Companias", routing.consignee_id)),
+        ("Notificado", _nombre(db, "Companias", routing.notify_id)),
+        ("Puerto de origen", _nombre(db, "Puertos", routing.puerto_origen_id)),
+        ("Puerto de destino", _nombre(db, "Puertos", routing.puerto_destino_id)),
+        ("Estado", routing.estado),
+    ]
+    pdf.set_text_color(0, 0, 0)
+    for etiqueta, valor in filas:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(50, 8, f"{etiqueta}:")
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 8, str(valor) if valor else "-", ln=True)
+
+    valores = db.query(models.RoutingValores).filter(
+        models.RoutingValores.routing_id == routing.id
+    ).all()
+    if valores:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_fill_color(20, 60, 120)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(100, 8, "Rubro", border=1, fill=True)
+        pdf.cell(40, 8, "Venta", border=1, fill=True, align="R")
+        pdf.cell(40, 8, "IVA", border=1, fill=True, align="R", ln=True)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 11)
+        iva_pct = routing.iva_porcentaje if routing.iva_porcentaje is not None else _iva_vigente(db)
+        subtotal = 0.0
+        iva_total = 0.0
+        for v in valores:
+            venta = v.venta or 0.0
+            iva = round(venta * iva_pct / 100, 2) if v.aplica_iva else 0.0
+            subtotal += venta
+            iva_total += iva
+            pdf.cell(100, 8, _nombre(db, "Rubros", v.rubro_id) or "-", border=1)
+            pdf.cell(40, 8, f"{venta:.2f}", border=1, align="R")
+            pdf.cell(40, 8, f"{iva:.2f}", border=1, align="R", ln=True)
+
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(140, 8, "TOTAL", border=1, align="R")
+        pdf.cell(40, 8, f"{subtotal + iva_total:.2f}", border=1, align="R", ln=True)
+
+    return bytes(pdf.output())
+
+
 @app.put("/routing/{routing_id}/completar", response_model=schemas.RoutingRead)
 def completar_routing(
     routing_id: int,
@@ -485,6 +707,25 @@ def completar_routing(
 
     db.commit()
     db.refresh(routing)
+
+    # Correo a la Customer con el PDF adjunto. Si falla o no hay SMTP configurado,
+    # NO se bloquea la respuesta: el Routing ya quedo completado de todas formas.
+    try:
+        correo_customer = _correo_customer(db, routing)
+        if correo_customer and SMTP_HOST:
+            pdf_bytes = _generar_pdf_routing(db, routing)
+            asunto = f"Routing {routing.numero_routing} completado"
+            cuerpo = (
+                f"Estimados, buenas tardes.\n\n"
+                f"Se completo el Routing {routing.numero_routing}. Se adjunta el detalle en PDF.\n\n"
+                f"Saludos cordiales."
+            )
+            _enviar_correo(
+                db, [correo_customer], asunto, cuerpo, [(f"Routing_{routing.numero_routing}.pdf", pdf_bytes)]
+            )
+    except Exception:
+        pass
+
     return routing
 
 
@@ -718,7 +959,9 @@ def eliminar_bl_master(
 
 @app.post("/bl-hijo", response_model=schemas.BlHijoRead)
 def crear_bl_hijo(
-    bl: schemas.BlHijoCreate, db: Session = Depends(get_db), actor=Depends(requiere("bl", CREAR))
+    bl: schemas.BlHijoCreateConContenedores,
+    db: Session = Depends(get_db),
+    actor=Depends(requiere("bl", CREAR)),
 ):
     master = db.query(models.BlMaster).filter(models.BlMaster.id == bl.bl_master_id).first()
     if master is None:
@@ -738,7 +981,7 @@ def crear_bl_hijo(
     if repetido is not None:
         raise HTTPException(status_code=400, detail="Ya existe un BL Hijo con ese código")
 
-    datos = bl.model_dump()
+    datos = bl.model_dump(exclude={"contenedores"})
 
     def heredar(campo, valor):
         if datos[campo] is None:
@@ -769,6 +1012,18 @@ def crear_bl_hijo(
 
     nuevo = models.BlHijo(**datos, secuencial=secuencial, estado="ASIGNADO")
     db.add(nuevo)
+    db.flush()  # para tener nuevo.id y poder crear los contenedores ligados a el
+
+    for item in bl.contenedores:
+        db.add(models.Contenedores(**item.model_dump(), bl_hijo_id=nuevo.id))
+    db.flush()
+
+    bultos, peso, volumen = _totales_del_master(db, master.id)
+    error = _error_si_excede(master, bultos, peso, volumen)
+    if error is not None:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=error)
+
     try:
         db.commit()
     except IntegrityError:
@@ -778,6 +1033,28 @@ def crear_bl_hijo(
             detail="Revisa que las compañías, puertos, línea, naviera, almacén, moneda y pago existan",
         )
     db.refresh(nuevo)
+
+    # Correo a la Customer + Operaciones con el PDF del BL Hijo. Es un extra: si falla
+    # o no hay SMTP configurado, el BL Hijo ya quedo guardado de todas formas.
+    try:
+        destinatarios = _correos_operaciones(db)
+        correo_customer = _correo_customer(db, routing) if routing is not None else None
+        if correo_customer:
+            destinatarios.add(correo_customer)
+        if destinatarios and SMTP_HOST:
+            pdf_bytes = _generar_pdf_bl_hijo(db, nuevo)
+            asunto = f"BL Hijo {nuevo.codigo_bl} generado"
+            cuerpo = (
+                f"Estimados, buenas tardes.\n\n"
+                f"Se generó el BL Hijo {nuevo.codigo_bl}. Se adjunta el documento en PDF.\n\n"
+                f"Saludos cordiales."
+            )
+            _enviar_correo(
+                db, sorted(destinatarios), asunto, cuerpo, [(f"BL_{nuevo.codigo_bl}.pdf", pdf_bytes)]
+            )
+    except Exception:
+        pass
+
     return nuevo
 
 
@@ -1073,26 +1350,35 @@ def _redactar_aviso(aviso: dict):
     return asunto, cuerpo
 
 
-def _enviar_correo(destinatarios, asunto: str, cuerpo: str):
-    """Manda el correo de verdad, usando las credenciales SMTP_* del .env."""
-    if not SMTP_HOST:
+def _enviar_correo(db: Session, destinatarios, asunto: str, cuerpo: str, adjuntos: list = None):
+    """Manda el correo de verdad, usando la configuracion guardada en la base de datos
+    (con respaldo en el .env si algo todavia no esta configurado ahi)."""
+    smtp_host = _config_obtener(db, "SMTP_HOST")
+    if not smtp_host:
         raise HTTPException(
             status_code=400,
-            detail="El envío por correo no está configurado (faltan las variables SMTP_* en el "
-            ".env). Si ya lo enviaste por otro medio, usa /marcar-notificado.",
+            detail="El envío por correo no está configurado (falta SMTP_HOST). Configúralo en "
+            "PUT /configuracion/SMTP_HOST, o usa /marcar-notificado si ya lo enviaste por otro medio.",
         )
+    smtp_port = int(_config_obtener(db, "SMTP_PORT", "587"))
+    smtp_user = _config_obtener(db, "SMTP_USER")
+    smtp_password = _config_obtener(db, "SMTP_PASSWORD")
+    smtp_from = _config_obtener(db, "SMTP_FROM", smtp_user)
 
     mensaje = EmailMessage()
     mensaje["Subject"] = asunto
-    mensaje["From"] = SMTP_FROM or ""
+    mensaje["From"] = smtp_from or ""
     mensaje["To"] = ", ".join(destinatarios)
     mensaje.set_content(cuerpo)
 
+    for nombre, contenido in (adjuntos or []):
+        mensaje.add_attachment(contenido, maintype="application", subtype="pdf", filename=nombre)
+
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as servidor:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as servidor:
             servidor.starttls()
-            if SMTP_USER:
-                servidor.login(SMTP_USER, SMTP_PASSWORD or "")
+            if smtp_user:
+                servidor.login(smtp_user, smtp_password or "")
             servidor.send_message(mensaje)
     except (smtplib.SMTPException, OSError) as error:
         raise HTTPException(status_code=502, detail=f"No se pudo enviar el correo: {error}")
@@ -1106,7 +1392,7 @@ def _armar_aviso(db: Session, hijo: models.BlHijo) -> dict:
     if hijo.routing_id is not None:
         routing = db.query(models.Routing).filter(models.Routing.id == hijo.routing_id).first()
 
-    iva_pct = IVA_VIGENTE
+    iva_pct = _iva_vigente(db)
     if routing is not None and routing.iva_porcentaje is not None:
         iva_pct = routing.iva_porcentaje
 
@@ -1175,6 +1461,136 @@ def _armar_aviso(db: Session, hijo: models.BlHijo) -> dict:
     }
     aviso["asunto"], aviso["cuerpo"] = _redactar_aviso(aviso)
     return aviso
+
+
+def _generar_pdf_bl_hijo(db: Session, hijo: models.BlHijo) -> bytes:
+    """PDF de una pagina con el detalle del BL Hijo (documento de transporte)."""
+    pdf = FPDF()
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(20, 60, 120)
+    pdf.cell(0, 10, f"BL {hijo.codigo_bl}", ln=True)
+    pdf.set_draw_color(20, 60, 120)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    filas = [
+        ("Secuencial", hijo.secuencial),
+        ("Embarcador", _nombre(db, "Companias", hijo.embarcador_id)),
+        ("Consignatario", _nombre(db, "Companias", hijo.consignatario_id)),
+        ("Notificado", _nombre(db, "Companias", hijo.notificado1_id)),
+        ("Origen", _nombre(db, "Puertos", hijo.origen_id)),
+        ("Puerto de embarque", _nombre(db, "Puertos", hijo.puerto_embarque_id)),
+        ("Puerto de destino", _nombre(db, "Puertos", hijo.puerto_destino_id)),
+        ("Fecha de embarque", hijo.fecha_embarque),
+        ("ETA", hijo.eta),
+        ("Marcas y números", hijo.marcas_numeros),
+        ("Descripción", hijo.descripcion_bienes),
+        ("Instrucciones", hijo.instrucciones_handling),
+    ]
+    pdf.set_text_color(0, 0, 0)
+    for etiqueta, valor in filas:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(50, 8, f"{etiqueta}:")
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 8, str(valor) if valor else "-", ln=True)
+
+    contenedores = db.query(models.Contenedores).filter(
+        models.Contenedores.bl_hijo_id == hijo.id
+    ).order_by(models.Contenedores.id).all()
+    if contenedores:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_fill_color(20, 60, 120)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(50, 8, "Contenedor", border=1, fill=True)
+        pdf.cell(30, 8, "Bultos", border=1, fill=True, align="R")
+        pdf.cell(30, 8, "Peso Kg", border=1, fill=True, align="R")
+        pdf.cell(30, 8, "Vol m3", border=1, fill=True, align="R", ln=True)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 11)
+        for c in contenedores:
+            pdf.cell(50, 8, c.numero_contenedor or "-", border=1)
+            pdf.cell(30, 8, f"{c.no_bultos or 0}", border=1, align="R")
+            pdf.cell(30, 8, f"{c.peso_kg or 0:.2f}", border=1, align="R")
+            pdf.cell(30, 8, f"{c.volumen_m3 or 0:.2f}", border=1, align="R", ln=True)
+
+    return bytes(pdf.output())
+
+
+def _generar_pdf_aviso(aviso: dict) -> bytes:
+    """Arma un PDF de una pagina con todo el detalle del Aviso de Llegada."""
+    pdf = FPDF()
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(20, 60, 120)
+    pdf.cell(0, 10, f"AVISO DE LLEGADA - BL {aviso['bl_hijo']}", ln=True)
+    pdf.set_draw_color(20, 60, 120)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    filas = [
+        ("Routing", aviso["routing"]),
+        ("MRN", aviso["mrn"]),
+        ("BL Master", aviso["bl_master"]),
+        ("BL Hijo", aviso["bl_hijo"]),
+        ("Buque", aviso["buque"]),
+        ("Viaje", aviso["viaje"]),
+        ("Fecha de llegada", aviso["fecha_llegada"]),
+        ("Puerto de arribo", aviso["puerto_arribo"]),
+        ("Almacén", aviso["almacen"]),
+        ("Consignatario", aviso["consignatario"]),
+        ("Descripción", aviso["descripcion"]),
+    ]
+    pdf.set_text_color(0, 0, 0)
+    for etiqueta, valor in filas:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(50, 8, f"{etiqueta}:")
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 8, str(valor) if valor else "-", ln=True)
+
+    if aviso["contenedores"]:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_fill_color(20, 60, 120)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(50, 8, "Contenedor", border=1, fill=True)
+        pdf.cell(30, 8, "Bultos", border=1, fill=True, align="R")
+        pdf.cell(30, 8, "Peso Kg", border=1, fill=True, align="R")
+        pdf.cell(30, 8, "Vol m3", border=1, fill=True, align="R", ln=True)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 11)
+        for c in aviso["contenedores"]:
+            pdf.cell(50, 8, c["numero"] or "-", border=1)
+            pdf.cell(30, 8, f"{c['bultos']}", border=1, align="R")
+            pdf.cell(30, 8, f"{c['peso_kg']:.2f}", border=1, align="R")
+            pdf.cell(30, 8, f"{c['volumen_m3']:.2f}", border=1, align="R", ln=True)
+
+    if aviso["rubros"]:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_fill_color(20, 60, 120)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(100, 8, "Rubro", border=1, fill=True)
+        pdf.cell(40, 8, "Venta", border=1, fill=True, align="R")
+        pdf.cell(40, 8, "IVA", border=1, fill=True, align="R", ln=True)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 11)
+        for r in aviso["rubros"]:
+            pdf.cell(100, 8, r["rubro"] or "-", border=1)
+            pdf.cell(40, 8, f"{r['venta']:.2f}", border=1, align="R")
+            pdf.cell(40, 8, f"{r['iva']:.2f}", border=1, align="R", ln=True)
+
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(140, 8, "TOTAL", border=1, align="R")
+        pdf.cell(40, 8, f"{aviso['total']:.2f}", border=1, align="R", ln=True)
+
+    return bytes(pdf.output())
 
 
 @app.get("/aviso-llegada/buscar", response_model=List[schemas.AvisoBusquedaRead])
@@ -1262,7 +1678,11 @@ def enviar_por_correo(
             detail="No hay destinatarios: falta el correo de la Customer o de los usuarios de OPERACIONES.",
         )
 
-    _enviar_correo(aviso["destinatarios"], aviso["asunto"], aviso["cuerpo"])
+    adjuntos = [
+        (f"Aviso_{aviso['bl_hijo']}.pdf", _generar_pdf_aviso(aviso)),
+        (f"BL_{hijo.codigo_bl}.pdf", _generar_pdf_bl_hijo(db, hijo)),
+    ]
+    _enviar_correo(db, aviso["destinatarios"], aviso["asunto"], aviso["cuerpo"], adjuntos)
 
     hijo.estado = "NOTIFICADO"
     db.commit()
@@ -1606,3 +2026,29 @@ def eliminar_maestro(
             detail="No se puede eliminar: este registro ya está en uso. Mejor desactívalo (activo=false).",
         )
     return {"eliminado": True}  
+
+
+# ---------------- CONFIGURACIÓN (API) ----------------
+
+@app.get("/configuracion", response_model=List[schemas.ConfiguracionRead])
+def listar_configuracion(db: Session = Depends(get_db), actor=Depends(requiere("configuracion", VER))):
+    """Los valores guardados. Los sensibles (como SMTP_PASSWORD) se muestran ocultos."""
+    filas = db.query(models.Configuracion).order_by(models.Configuracion.clave).all()
+    return [
+        {"clave": f.clave, "valor": "********" if f.clave in CLAVES_SENSIBLES else f.valor}
+        for f in filas
+    ]
+
+
+@app.put("/configuracion/{clave}", response_model=schemas.ConfiguracionRead)
+def guardar_configuracion(
+    clave: str,
+    datos: schemas.ConfiguracionUpdate,
+    db: Session = Depends(get_db),
+    actor=Depends(requiere("configuracion", EDITAR)),
+):
+    """Crea o actualiza un valor. Ej: PUT /configuracion/IVA_PORCENTAJE {"valor": "15"}"""
+    clave = clave.strip().upper()
+    fila = _config_guardar(db, clave, datos.valor)
+    valor_mostrado = "********" if clave in CLAVES_SENSIBLES else fila.valor
+    return {"clave": fila.clave, "valor": valor_mostrado}

@@ -241,3 +241,13 @@ def _make_maestro_class(tabla: str):
 
 for _tabla in MAESTROS_SIMPLES:
     globals()[_tabla.title().replace("_", "")] = _make_maestro_class(_tabla)
+
+
+class Configuracion(Base):
+    """Valores editables por el Administrador (IVA, credenciales de correo, etc.)."""
+
+    __tablename__ = "configuracion"
+
+    id = Column(Integer, primary_key=True, index=True)
+    clave = Column(String, unique=True, nullable=False, index=True)
+    valor = Column(String, nullable=False)

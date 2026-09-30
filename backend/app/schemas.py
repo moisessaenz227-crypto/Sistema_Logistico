@@ -497,3 +497,17 @@ class UsuarioUpdate(BaseModel):
     rol_id: Optional[int] = None
     activo: Optional[bool] = None
     password: Optional[str] = Field(default=None, min_length=6)
+
+
+class BlHijoCreateConContenedores(BlHijoCreate):
+    contenedores: List[ContenedorCreate] = []
+
+
+class ConfiguracionUpdate(BaseModel):
+    valor: str
+
+
+class ConfiguracionRead(BaseModel):
+    clave: str
+    valor: str
+

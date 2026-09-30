@@ -5,3 +5,5 @@ psycopg[binary]==3.2.10
 alembic==1.13.3
 python-dotenv==1.0.1
 pydantic>=2.9
+fpdf2>=2.7
+cryptography>=42
